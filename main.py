@@ -48,6 +48,7 @@ CONFIG = {
     'PHOTO_CHECK_INTERVAL': 5,
     'PHOTO_CHECK_WINDOW': 5,
     'CAMERA_INDEX': 0,
+    'CAMERA_WARMUP_FRAMES': 15,  # discard this many frames per capture so exposure adjusts
     'HF_TOKEN': os.environ.get('HF_KEY'),
     'GEMINI_API_KEY': os.environ.get('GEMINI_KEY'),
     'SAMPLE_RATE': 16000
@@ -138,6 +139,24 @@ def has_voice_activity(waveform):
     vad_result = vad_pipeline(file_like)
     return len(list(vad_result.itertracks())) > 0
 
+def init_camera():
+    """Open camera on the main thread to request permission and warm up (exposure, etc.).
+    Call once at startup before any worker threads use the camera.
+    """
+    camera_index = CONFIG.get("CAMERA_INDEX", 0)
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        print("⚠️ Camera could not be opened; photo capture may fail.")
+        return
+    # Read several frames so macOS shows permission dialog here (main thread)
+    # and the camera adjusts exposure/white balance so later captures aren't dark
+    warmup_frames = 30
+    for _ in range(warmup_frames):
+        cap.read()
+    cap.release()
+    print("📷 Camera initialized (permission granted, warmed up)")
+
+
 def take_camera_photo(label=""):
     """Capture and save a photo from the camera."""
     timestamp = datetime.now()
@@ -145,6 +164,12 @@ def take_camera_photo(label=""):
     filename = f"photos/photo_{timestamp.strftime('%Y%m%d_%H%M%S')}_{label}.png"
     cap = cv2.VideoCapture(CONFIG.get("CAMERA_INDEX", 0))
     try:
+        if not cap.isOpened():
+            return timestamp, None
+        # Discard frames so exposure/white balance adjust (first frames after open are often dark)
+        warmup = CONFIG.get("CAMERA_WARMUP_FRAMES", 15)
+        for _ in range(warmup):
+            cap.read()
         ret, frame = cap.read()
         if not ret or frame is None:
             return timestamp, None
@@ -498,6 +523,7 @@ def _print_latency_metrics():
 
 def main():
     """Start all threads"""
+    init_camera()
     threads = [
         threading.Thread(target=audio_capture_thread, daemon=True),
         threading.Thread(target=speaker_identification_thread, daemon=True),
