@@ -1,3 +1,5 @@
+import pyannote_load_patch  # noqa: F401 — before any pyannote model load
+
 import torch
 import pickle
 import numpy as np
@@ -16,10 +18,23 @@ import google.generativeai as genai
 from PIL import ImageGrab
 import os
 from dotenv import load_dotenv
+from huggingface_hub import login
+import whisper
 
+
+# --- auth
 load_dotenv()
 
-# Configuration
+hf_token = os.environ.get("HF_KEY")
+if not hf_token:
+    raise SystemExit(
+        "HF_KEY must be set. "
+        "Accept conditions at https://hf.co/pyannote/embedding and "
+        "https://hf.co/pyannote/speaker-diarization-3.1"
+    )
+login(token=hf_token)
+
+# --- things
 CONFIG = {
     'SPEAKER_THRESHOLD': 0.3,
     'CHUNK_DURATION': 2,  # seconds per audio chunk
@@ -34,11 +49,16 @@ CONFIG = {
     'SAMPLE_RATE': 16000
 }
 
-# Initialize Gemini
+# Load Whisper model (do this once at startup, after other models)
+print("Loading Whisper model...")
+whisper_model = whisper.load_model("base")  # or "small", "medium", "large"
+print("✓ Whisper loaded")
+
 genai.configure(api_key=CONFIG['GEMINI_API_KEY'])
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# Load speaker database
+
+# --- getting annote 
 with open("speaker_db.pkl", "rb") as f:
     speaker_db = pickle.load(f)
 
@@ -46,7 +66,8 @@ with open("speaker_db.pkl", "rb") as f:
 embedding_model = Inference("pyannote/embedding", window="whole")
 audio_processor = Audio(sample_rate=CONFIG['SAMPLE_RATE'], mono="downmix")
 
-# Global state
+
+# --- app stuff
 class ConversationState:
     def __init__(self):
         self.active = False
@@ -63,13 +84,23 @@ state = ConversationState()
 audio_queue = queue.Queue()
 ui_notification_queue = queue.Queue()
 
+def _embedding_vector(arr):
+    """Normalize to (512,) for cosine: handle both whole-window (512,) and sliding (T, 512)."""
+    x = np.asarray(arr).flatten()
+    if x.size == 512:
+        return x
+    x = x.reshape(-1, 512)
+    return x.mean(axis=0)
+
+
 def identify_speaker(embedding):
     """Compare embedding against database"""
     best_match = None
     min_distance = float('inf')
-    
+    emb = _embedding_vector(embedding)
     for name, ref_embedding in speaker_db.items():
-        dist = cosine(embedding.flatten(), ref_embedding.flatten())
+        ref = _embedding_vector(ref_embedding)
+        dist = cosine(emb, ref)
         if dist < min_distance:
             min_distance = dist
             best_match = name
@@ -93,14 +124,22 @@ def take_screenshot(label=""):
     screenshot.save(filename)
     return timestamp, filename
 
-def transcribe_audio(waveform_data):
-    """Placeholder - integrate Whisper or similar STT"""
-    # You'll need to implement actual STT here
-    # Example with whisper:
-    # import whisper
-    # result = whisper_model.transcribe(waveform_data)
-    # return result['text']
-    return "[TRANSCRIPTION PLACEHOLDER]"
+def transcribe_audio(waveform):
+    """Transcribe audio using Whisper"""
+    try:
+        # Whisper expects float32 numpy array
+        audio_np = np.array(waveform, dtype=np.float32)
+        
+        # Whisper prefers longer segments, but will work with 2s chunks
+        result = whisper_model.transcribe(
+            audio_np,
+            language='en',  # or None for auto-detect
+            fp16=False  # set True if using GPU
+        )
+        return result['text'].strip()
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        return ""
 
 def check_for_todos(text_window):
     """Check text for TODO indicators"""
@@ -192,12 +231,17 @@ def audio_capture_thread():
 def speaker_identification_thread():
     """Process audio chunks for speaker ID and transcription"""
     global state
+    current_speaker = None
     
     while True:
         timestamp, waveform = audio_queue.get()
         
         # Check for voice activity
         if not has_voice_activity(waveform):
+            if current_speaker is not None:
+                print(f"\n🔇 Silence...")
+                current_speaker = None
+            
             with state.lock:
                 if state.active and (time.time() - state.last_activity) > CONFIG['SILENCE_TIMEOUT']:
                     # End conversation
@@ -205,15 +249,26 @@ def speaker_identification_thread():
                     end_conversation()
                     state.active = False
                     state.speakers.clear()
+                    current_speaker = None
             continue
         
-        # Voice detected
+        # Voice detected - identify speaker
         waveform_torch = torch.tensor(waveform).unsqueeze(0)
         embedding = embedding_model({"waveform": waveform_torch, "sample_rate": CONFIG['SAMPLE_RATE']})
         speaker = identify_speaker(embedding)
         
         # Transcribe
         text = transcribe_audio(waveform)
+        
+        # Skip if no text (noise, cough, etc)
+        if not text:
+            continue
+        
+        # LIVE DISPLAY
+        if speaker != current_speaker:
+            print(f"\n💬 {speaker}:")
+            current_speaker = speaker
+        print(f"   {text}")
         
         # Check for manual screenshot command
         if "gemini" in text.lower() and "screenshot" in text.lower():
@@ -231,16 +286,18 @@ def speaker_identification_thread():
                 state.active = True
                 state.transcript = []
                 state.screenshots = []
-                print("\n🟢 Conversation started")
+                current_speaker = speaker
+                print(f"\n🟢 Conversation started")
+                print(f"💬 {speaker}:")
+                print(f"   {text}")
             
             # Add/update speaker
             if speaker not in state.speakers:
                 state.speakers.add(speaker)
-                ui_notification_queue.put(("speaker_join", speaker))
+                print(f"👤 {speaker} joined the conversation")
             
             # Add to transcript
             state.transcript.append((datetime.fromtimestamp(timestamp), speaker, text))
-
 def todo_monitor_thread():
     """Periodically check for todos"""
     global state

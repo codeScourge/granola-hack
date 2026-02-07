@@ -1,92 +1,80 @@
-import pickle
-import numpy as np
+import pyannote_load_patch  # noqa: F401 — before any pyannote model load
+
+import os
 from pathlib import Path
-from pyannote.audio import Inference, Audio
-from scipy.spatial.distance import cosine
 
-# Load enrolled speakers
-with open("speaker_db.pkl", "rb") as f:
-    speaker_db = pickle.load(f)
+import torchaudio
+from dotenv import load_dotenv
+from huggingface_hub import login
+from pyannote.audio import Audio, Inference, Pipeline
+from pyannote.core import Segment
 
-model = Inference("pyannote/embedding", window="whole")
+from conversation_speakers import (
+    ConversationSpeakers,
+    clamp_segment,
+    load_speaker_db,
+)
+
+# --- auth
+load_dotenv()
+hf_token = os.environ.get("HF_KEY")
+if not hf_token:
+    raise SystemExit(
+        "HF_KEY must be set. "
+        "Accept conditions at https://hf.co/pyannote/embedding and "
+        "https://hf.co/pyannote/speaker-diarization-3.1"
+    )
+login(token=hf_token)
+
+# --- build helper (chunk in → who is talking; or run file for diarize + identify)
+speaker_db = load_speaker_db()
 audio = Audio(sample_rate=16000, mono="downmix")
-
-THRESHOLD = 0.3  # Adjust based on testing
-
-def identify_speaker(embedding, threshold=THRESHOLD):
-    """Compare embedding against database"""
-    best_match = None
-    min_distance = float('inf')
-    
-    for name, ref_embedding in speaker_db.items():
-        dist = cosine(embedding.flatten(), ref_embedding.flatten())
-        if dist < min_distance:
-            min_distance = dist
-            best_match = name
-    
-    if min_distance < threshold:
-        return best_match, min_distance
-    return "UNKNOWN", min_distance
+helper = ConversationSpeakers(
+    embedding_model=Inference("pyannote/embedding", window="whole"),
+    diarization_pipeline=Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1",
+        use_auth_token=hf_token,
+    ),
+    audio=audio,
+    speaker_db=speaker_db,
+)
 
 
 def test_conversation_visual(audio_file):
     """
     Auto-segment and identify, then export for manual review.
-    No pre-labeling needed - you verify after seeing results.
+    Uses conversation_speakers helper; segments clamped to file bounds.
+    SHORT = segment too short for embedding model; distance inf = not computed.
     """
-    from pyannote.audio import Pipeline
-    from pyannote.core import Segment
-    
-    # Diarization auto-finds speaker segments
-    diarization = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token="YOUR_TOKEN"
-    )
-    
-    diar_result = diarization(audio_file)
-    
-    results = []
+    results = helper.run(audio_file, clamp_to_bounds=True)
+
     print(f"{'Time':<15} {'Diar':<12} {'Identified':<12} {'Distance':<10}")
-    print("="*50)
-    
-    for turn, _, diar_label in diar_result.itertracks(yield_label=True):
-        waveform, sr = audio.crop(audio_file, turn)
-        embedding = model({"waveform": waveform, "sample_rate": sr})
-        
-        identified, distance = identify_speaker(embedding)
-        
-        results.append({
-            "start": turn.start,
-            "end": turn.end,
-            "duration": turn.duration,
-            "diar_label": diar_label,
-            "identified": identified,
-            "distance": distance,
-        })
-        
-        print(f"{turn.start:5.1f}-{turn.end:5.1f}s  {diar_label:<12} "
-              f"{identified:<12} {distance:.3f}")
-    
-    # Save with audio clips for listening
+    print("=" * 50)
+    for r in results:
+        dist_str = f"{r['distance']:.3f}" if r["distance"] != float("inf") else "inf"
+        print(
+            f"{r['start']:5.1f}-{r['end']:5.1f}s  {r['diar_label']:<12} "
+            f"{r['identified']:<12} {dist_str}"
+        )
+
+    # Save clips for manual review (clamp segment to file duration to avoid crop errors)
     output_dir = Path("review_segments")
     output_dir.mkdir(exist_ok=True)
-    
+    file_duration = audio.get_duration(audio_file)
+
     for i, r in enumerate(results):
-        segment = Segment(r["start"], r["end"])
-        waveform, sr = audio.crop(audio_file, segment)
-        
-        # Save clip with descriptive name
-        filename = f"{i:03d}_{r['start']:.1f}s_{r['identified']}_dist{r['distance']:.2f}.wav"
-        import torchaudio
-        torchaudio.save(
-            output_dir / filename,
-            waveform,
-            sr
-        )
-    
+        seg = clamp_segment(Segment(r["start"], r["end"]), file_duration)
+        try:
+            waveform, sr = audio.crop(audio_file, seg)
+        except ValueError:
+            continue
+        dist_str = f"{r['distance']:.2f}" if r["distance"] != float("inf") else "inf"
+        filename = f"{i:03d}_{r['start']:.1f}s_{r['identified']}_dist{dist_str}.wav"
+        torchaudio.save(output_dir / filename, waveform, sr)
+
     print(f"\n{len(results)} segments saved to {output_dir}/")
-    print("Listen to clips and check if identified names are correct")
-    
     return results
 
-results = test_conversation_visual("4person_chat.mp3")
+
+if __name__ == "__main__":
+    results = test_conversation_visual("tests/00.mp3")

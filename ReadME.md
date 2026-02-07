@@ -23,12 +23,31 @@ tech
 - - segmentation model of speech vs non-speech, general speaker changes and overlaps
 - - embedding model of the same kind as used in enrollment
 - - clustering algorithm which takes the vectors created from the segmentation model with the ones of the embedding model to label them - automatically labels the not recognized things as "unknown"
+- => nooks and cranies
+- - sometimes clips are way too short, so it labels the thing as SHORT - embedding models have a minimum length (can be) => (must be interesting ways to increase this)
 - `test_speakers.py`should take an audio recording of a conversatiion between some of the speakers + "strangers"
 
+main.py is the actual loop that does stuff - prints to console who is talking and once conversation starts, prints keyword notification
+- continiously sends x second chunks into queue
+- starts the conversation when the Voice Activity Detection (VAD) model detects speaking
+- 3 threads: detects keywords, takes screenshots for "gemini, take a screenshot" or when a verbal cue is detected, notes down todos (by sending chunks of text from the transctipt)
+- compiles that after the conversation ends into a summary with the image data
+- returns  a string of summary (without todos) and squashes it with todos
 
 how to authenticate with HF? you can either use the login option for a session or pass the token parameter
-- go to the pages of https://huggingface.co/pyannote/embedding and https://huggingface.co/pyannote/speaker-diarization - fill in the form to accept the conditions. then create a read-key
+- go to the pages of 
+    - https://huggingface.co/pyannote/embedding
+    - https://huggingface.co/pyannote/speaker-diarization
+    - https://huggingface.co/pyannote/speaker-diarization-3.1
+    - https://huggingface.co/pyannote/speaker-diarization-3.0
+    - https://huggingface.co/pyannote/segmentation-3.0 
+- fill in the form to accept the conditions. then create a read-key
 - pyannote uses old auth functions, so we had to downgrade it
+
+
+test-sets
+- 00.mp3: joey ivan and one stranger
+
 
 ```
 === SECTION 1: Phonetically Balanced (30 seconds) ===
