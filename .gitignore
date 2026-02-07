@@ -1,5 +1,6 @@
 # --- ow
 review_segments/*.mp3
+screenshots/*.png
 
 # --- preset
 # Byte-compiled / optimized / DLL files

@@ -17,7 +17,7 @@ from datetime import datetime
 import re
 from collections import deque
 import google.generativeai as genai
-from PIL import ImageGrab
+import cv2
 import os
 from dotenv import load_dotenv
 from huggingface_hub import login
@@ -45,8 +45,9 @@ CONFIG = {
     'SILENCE_TIMEOUT': 15,
     'TODO_CHECK_INTERVAL': 5, 
     'TODO_CHECK_WINDOW': 5,
-    'SCREENSHOT_CHECK_INTERVAL': 5,
-    'SCREENSHOT_CHECK_WINDOW': 5,
+    'PHOTO_CHECK_INTERVAL': 5,
+    'PHOTO_CHECK_WINDOW': 5,
+    'CAMERA_INDEX': 0,
     'HF_TOKEN': os.environ.get('HF_KEY'),
     'GEMINI_API_KEY': os.environ.get('GEMINI_KEY'),
     'SAMPLE_RATE': 16000
@@ -82,8 +83,11 @@ class ConversationState:
         self.active = False
         self.speakers = set()
         self.transcript = []  # [(timestamp, speaker, text)]
-        self.screenshots = []  # [(timestamp, filepath)]
+        self.photos = []  # [(timestamp, filepath)]
         self.last_activity = time.time()
+        self.last_manual_photo_time = 0.0  # cooldown to avoid repeated triggers
+        self.last_auto_photo_time = 0.0
+        self.emitted_todos = set()  # dedupe TODOs within conversation
         self.audio_buffer = deque(maxlen=100)  # rolling buffer (transcript)
         # Raw audio: last CONTEXT_SECONDS (e.g. 5) chunks of CAPTURE_CHUNK_DURATION each
         self.raw_audio_buffer = deque(maxlen=CONFIG['CONTEXT_SECONDS'])
@@ -101,7 +105,7 @@ _latency_metrics = {
     "speaker_diarization": [],
     "todo_check": [],
     "visual_cue_check": [],
-    "screenshot_keyword_check": [],
+    "photo_keyword_check": [],
 }
 
 def _embedding_vector(arr):
@@ -134,15 +138,20 @@ def has_voice_activity(waveform):
     vad_result = vad_pipeline(file_like)
     return len(list(vad_result.itertracks())) > 0
 
-def take_screenshot(label=""):
-    """Capture and save screenshot"""
+def take_camera_photo(label=""):
+    """Capture and save a photo from the camera."""
     timestamp = datetime.now()
-    filename = f"screenshots/screenshot_{timestamp.strftime('%Y%m%d_%H%M%S')}_{label}.png"
-    os.makedirs("screenshots", exist_ok=True)
-    
-    screenshot = ImageGrab.grab()
-    screenshot.save(filename)
-    return timestamp, filename
+    os.makedirs("photos", exist_ok=True)
+    filename = f"photos/photo_{timestamp.strftime('%Y%m%d_%H%M%S')}_{label}.png"
+    cap = cv2.VideoCapture(CONFIG.get("CAMERA_INDEX", 0))
+    try:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            return timestamp, None
+        cv2.imwrite(filename, frame)
+        return timestamp, filename
+    finally:
+        cap.release()
 
 def transcribe_audio(waveform):
     """Transcribe audio using Whisper"""
@@ -181,10 +190,10 @@ Todo items:"""
         return []
 
 def check_for_visual_cues(text_window):
-    """Check for visual reference cues"""
-    prompt = f"""Does this conversation fragment contain references to visual content?
-Look for phrases like "look at this", "see that", "on the screen", etc.
-Do NOT trigger on "gemini, screenshot this".
+    """Check for visual reference cues (e.g. "look at this", "take a photo")"""
+    prompt = f"""Does this conversation fragment contain references to showing or capturing something visually?
+Look for phrases like "look at this", "see that", "take a photo", "snap a picture", etc.
+Do NOT trigger on "gemini, take a photo" (that is an explicit command).
 Answer only YES or NO.
 
 Conversation:
@@ -197,20 +206,17 @@ Conversation:
         print(f"Visual cue check error: {e}")
         return False
 
-def summarize_conversation(transcript, screenshots):
+def summarize_conversation(transcript, photos):
     """Generate final summary"""
-    # Build context with positioned screenshots
+    # Build context with positioned camera photos
     context = "# Conversation Transcript\n\n"
-    
-    screenshot_dict = {ts: path for ts, path in screenshots}
     
     for ts, speaker, text in transcript:
         context += f"[{ts.strftime('%H:%M:%S')}] {speaker}: {text}\n"
-        
-        # Check if screenshot happened around this time
-        for ss_ts, ss_path in screenshots:
-            if abs((ss_ts - ts).total_seconds()) < 5:
-                context += f"  📸 Screenshot: {ss_path}\n"
+        # Check if a photo was taken around this time
+        for photo_ts, photo_path in photos:
+            if abs((photo_ts - ts).total_seconds()) < 5:
+                context += f"  📷 Photo: {photo_path}\n"
     
     prompt = f"""Summarize this conversation clearly and concisely. 
 Do NOT include todos in the summary - they will be listed separately.
@@ -316,14 +322,22 @@ def speaker_identification_thread():
         print(f"   {text}")
 
         t0 = time.perf_counter()
-        screenshot_triggered = "gemini" in text.lower() and "screenshot" in text.lower()
+        photo_triggered = ("gemini" in text.lower() and
+                          ("photo" in text.lower() or "camera" in text.lower()))
         with _metrics_lock:
-            _latency_metrics["screenshot_keyword_check"].append(time.perf_counter() - t0)
-        if screenshot_triggered:
-            ts, path = take_screenshot("manual")
+            _latency_metrics["photo_keyword_check"].append(time.perf_counter() - t0)
+        if photo_triggered:
             with state.lock:
-                state.screenshots.append((datetime.fromtimestamp(timestamp), path))
-            ui_notification_queue.put(("screenshot", f"Screenshot saved: {path}"))
+                if time.time() - state.last_manual_photo_time < 15:
+                    photo_triggered = False  # cooldown: same utterance in overlapping windows
+                else:
+                    state.last_manual_photo_time = time.time()
+            if photo_triggered:
+                ts, path = take_camera_photo("manual")
+                if path:
+                    with state.lock:
+                        state.photos.append((datetime.fromtimestamp(timestamp), path))
+                    ui_notification_queue.put(("photo", f"Camera photo saved: {path}"))
 
         with state.lock:
             state.last_activity = time.time()
@@ -331,7 +345,8 @@ def speaker_identification_thread():
             if not state.active:
                 state.active = True
                 state.transcript = []
-                state.screenshots = []
+                state.photos = []
+                state.emitted_todos = set()
                 current_speaker = speaker
                 print(f"\n🟢 Conversation started")
                 print(f"💬 {speaker}:")
@@ -361,12 +376,16 @@ def todo_monitor_thread():
             last_check_idx = len(state.transcript)
         
         t0 = time.perf_counter()
-        todos = check_for_todos(text_window)
+        todos = "" # TODO: check_for_todos(text_window)
         with _metrics_lock:
             _latency_metrics["todo_check"].append(time.perf_counter() - t0)
-        for todo in todos:
+        with state.lock:
+            seen = state.emitted_todos
+            new_todos = [t for t in todos if t and t not in seen]
+            for t in new_todos:
+                seen.add(t)
+        for todo in new_todos:
             ui_notification_queue.put(("todo", todo))
-            print(f"✓ TODO detected: {todo}")
 
 def visual_cue_monitor_thread():
     """Periodically check for visual references"""
@@ -374,7 +393,7 @@ def visual_cue_monitor_thread():
     last_check_idx = 0
     
     while True:
-        time.sleep(CONFIG['SCREENSHOT_CHECK_INTERVAL'])
+        time.sleep(CONFIG['PHOTO_CHECK_INTERVAL'])
         
         with state.lock:
             if not state.active:
@@ -392,11 +411,17 @@ def visual_cue_monitor_thread():
         with _metrics_lock:
             _latency_metrics["visual_cue_check"].append(time.perf_counter() - t0)
         if visual_cue:
-            ts, path = take_screenshot("auto")
             with state.lock:
-                state.screenshots.append((ts, path))
-            ui_notification_queue.put(("screenshot", "Auto screenshot taken"))
-            print(f"📸 Auto screenshot: {path}")
+                if time.time() - state.last_auto_photo_time < 15:
+                    visual_cue = False  # cooldown
+                else:
+                    state.last_auto_photo_time = time.time()
+            if visual_cue:
+                ts, path = take_camera_photo("auto")
+                if path:
+                    with state.lock:
+                        state.photos.append((ts, path))
+                    ui_notification_queue.put(("photo", "Auto camera photo taken"))
 
 def ui_notification_thread():
     """Display UI notifications (placeholder - implement actual UI)"""
@@ -409,8 +434,8 @@ def ui_notification_thread():
             print(f"👤 {data} joined")
         elif notification_type == "todo":
             print(f"✓ TODO: {data}")
-        elif notification_type == "screenshot":
-            print(f"📸 {data}")
+        elif notification_type == "photo":
+            print(f"📷 {data}")
         
         # Auto-dismiss after 1 second would happen in real UI
         time.sleep(1)
@@ -421,14 +446,14 @@ def end_conversation():
     
     with state.lock:
         transcript = state.transcript.copy()
-        screenshots = state.screenshots.copy()
+        photos = state.photos.copy()
     
-    # Extract all todos from full transcript
+
     full_text = "\n".join([f"{s}: {t}" for _, s, t in transcript])
-    all_todos = check_for_todos(full_text)
+    all_todos = "" # TODO: check_for_todos(full_text)
     
     # Generate summary
-    summary = summarize_conversation(transcript, screenshots)
+    summary = summarize_conversation(transcript, photos)
     
     # Save to file
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
