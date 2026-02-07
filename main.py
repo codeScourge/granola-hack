@@ -5,6 +5,8 @@ import pickle
 import numpy as np
 from pyannote.audio import Pipeline, Inference
 from pyannote.audio import Audio
+from pyannote.audio import Model
+from pyannote.audio.pipelines import VoiceActivityDetection
 from scipy.spatial.distance import cosine
 import pyaudio
 import wave
@@ -37,15 +39,14 @@ login(token=hf_token)
 # --- things
 CONFIG = {
     'SPEAKER_THRESHOLD': 0.3,
-    'CHECK_INTERVAL': 1,       # run VAD/speaker/transcribe every 1s
-    'CONTEXT_SECONDS': 5,      # use last 5s of audio when processing
+    'CHECK_INTERVAL': 3,       # run VAD/speaker/transcribe every 1s
+    'CONTEXT_SECONDS': 3,      # use last 5s of audio when processing
     'CAPTURE_CHUNK_DURATION': 1,  # capture in 1s chunks for the rolling buffer
-    'SILENCE_TIMEOUT': 10,
+    'SILENCE_TIMEOUT': 15,
     'TODO_CHECK_INTERVAL': 5, 
-    'TODO_CHECK_WINDOW': 30,
+    'TODO_CHECK_WINDOW': 5,
     'SCREENSHOT_CHECK_INTERVAL': 5,
-    'SCREENSHOT_CHECK_WINDOW': 30,
-    'VAD_THRESHOLD': 0.01, 
+    'SCREENSHOT_CHECK_WINDOW': 5,
     'HF_TOKEN': os.environ.get('HF_KEY'),
     'GEMINI_API_KEY': os.environ.get('GEMINI_KEY'),
     'SAMPLE_RATE': 16000
@@ -71,6 +72,9 @@ with open("speaker_db.pkl", "rb") as f:
 embedding_model = Inference("pyannote/embedding", window="whole")
 audio_processor = Audio(sample_rate=CONFIG['SAMPLE_RATE'], mono="downmix")
 
+vad_model = Model.from_pretrained("pyannote/segmentation", token=hf_token)
+vad_pipeline = VoiceActivityDetection(segmentation=vad_model)
+vad_pipeline.instantiate({'onset': 0.5, 'offset': 0.5, 'min_duration_on': 0.1, 'min_duration_off': 0.1})
 
 # --- app stuff
 class ConversationState:
@@ -126,9 +130,9 @@ def identify_speaker(embedding):
     return "UNKNOWN"
 
 def has_voice_activity(waveform):
-    """Simple VAD based on energy"""
-    energy = np.abs(waveform).mean()
-    return energy > CONFIG['VAD_THRESHOLD']
+    file_like = {"waveform": torch.tensor(waveform).unsqueeze(0), "sample_rate": CONFIG['SAMPLE_RATE']}
+    vad_result = vad_pipeline(file_like)
+    return len(list(vad_result.itertracks())) > 0
 
 def take_screenshot(label=""):
     """Capture and save screenshot"""

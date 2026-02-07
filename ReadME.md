@@ -39,6 +39,7 @@ how to authenticate with HF? you can either use the login option for a session o
     - https://huggingface.co/pyannote/speaker-diarization-3.1
     - https://huggingface.co/pyannote/speaker-diarization-3.0
     - https://huggingface.co/pyannote/segmentation-3.0 
+    - https://huggingface.co/pyannote/segmentation
 - fill in the form to accept the conditions. then create a read-key
 - pyannote uses old auth functions, so we had to downgrade it
 
