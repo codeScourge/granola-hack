@@ -7,9 +7,7 @@
 Example layout:
 - `speakers_samples/ivan/spoken_noise.mp3` (and any other .mp3 in `ivan/`)
 - `speakers_samples/Alice/studio.mp3`, `speakers_samples/Alice/office.mp3`, …
-
 Diarization: the "enrollment" (training in voices) script is freely available from HuggingFace; the live app loads `speaker_db.pkl` produced by it.
-
 
 tech
 - `pyannote/embedding` converts arbitrary lengthed audio clips of a single person into a vector repsentation#

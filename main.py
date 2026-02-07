@@ -37,32 +37,37 @@ login(token=hf_token)
 # --- things
 CONFIG = {
     'SPEAKER_THRESHOLD': 0.3,
-    'CHUNK_DURATION': 2,  # seconds per audio chunk
-    'SILENCE_TIMEOUT': 30,  # X2 seconds of silence to end conversation
-    'TODO_CHECK_INTERVAL': 10,  # X seconds - check for todos
-    'TODO_CHECK_WINDOW': 30,  # Y seconds - window to analyze
+    'CHECK_INTERVAL': 1,       # run VAD/speaker/transcribe every 1s
+    'CONTEXT_SECONDS': 5,      # use last 5s of audio when processing
+    'CAPTURE_CHUNK_DURATION': 1,  # capture in 1s chunks for the rolling buffer
+    'SILENCE_TIMEOUT': 10,
+    'TODO_CHECK_INTERVAL': 5, 
+    'TODO_CHECK_WINDOW': 30,
     'SCREENSHOT_CHECK_INTERVAL': 5,
-    'SCREENSHOT_CHECK_WINDOW': 15,
-    'VAD_THRESHOLD': 0.02,  # voice activity detection threshold
-    'HF_TOKEN': os.environ.get('HF_KEY', ''),
+    'SCREENSHOT_CHECK_WINDOW': 30,
+    'VAD_THRESHOLD': 0.01, 
+    'HF_TOKEN': os.environ.get('HF_KEY'),
     'GEMINI_API_KEY': os.environ.get('GEMINI_KEY'),
     'SAMPLE_RATE': 16000
 }
 
-# Load Whisper model (do this once at startup, after other models)
-print("Loading Whisper model...")
-whisper_model = whisper.load_model("base")  # or "small", "medium", "large"
-print("✓ Whisper loaded")
 
+whisper_model = whisper.load_model("base")  # or "small", "medium", "large"
 genai.configure(api_key=CONFIG['GEMINI_API_KEY'])
 model = genai.GenerativeModel('gemini-2.0-flash')
+
+
+def _gemini_text(response):
+    """Safely get text from Gemini response; empty candidates (e.g. safety block) return ''."""
+    if not response.candidates:
+        return ""
+    return (response.text or "")
 
 
 # --- getting annote 
 with open("speaker_db.pkl", "rb") as f:
     speaker_db = pickle.load(f)
 
-# Load models
 embedding_model = Inference("pyannote/embedding", window="whole")
 audio_processor = Audio(sample_rate=CONFIG['SAMPLE_RATE'], mono="downmix")
 
@@ -75,13 +80,14 @@ class ConversationState:
         self.transcript = []  # [(timestamp, speaker, text)]
         self.screenshots = []  # [(timestamp, filepath)]
         self.last_activity = time.time()
-        self.audio_buffer = deque(maxlen=100)  # rolling buffer
+        self.audio_buffer = deque(maxlen=100)  # rolling buffer (transcript)
+        # Raw audio: last CONTEXT_SECONDS (e.g. 5) chunks of CAPTURE_CHUNK_DURATION each
+        self.raw_audio_buffer = deque(maxlen=CONFIG['CONTEXT_SECONDS'])
         self.lock = threading.Lock()
         
 state = ConversationState()
 
 # Queues for inter-thread communication
-audio_queue = queue.Queue()
 ui_notification_queue = queue.Queue()
 
 def _embedding_vector(arr):
@@ -153,7 +159,8 @@ Todo items:"""
     
     try:
         response = model.generate_content(prompt)
-        todos = [line.strip() for line in response.text.strip().split('\n') if line.strip()]
+        text = _gemini_text(response)
+        todos = [line.strip() for line in text.strip().split('\n') if line.strip()]
         return todos
     except Exception as e:
         print(f"Todo check error: {e}")
@@ -171,7 +178,7 @@ Conversation:
     
     try:
         response = model.generate_content(prompt)
-        return "YES" in response.text.upper()
+        return "YES" in _gemini_text(response).upper()
     except Exception as e:
         print(f"Visual cue check error: {e}")
         return False
@@ -200,100 +207,102 @@ Summary:"""
     
     try:
         response = model.generate_content(prompt)
-        return response.text
+        return _gemini_text(response) or "Summary generation failed"
     except Exception as e:
         print(f"Summarization error: {e}")
         return "Summary generation failed"
 
 def audio_capture_thread():
-    """Continuously capture audio"""
+    """Continuously capture audio in 1s chunks into rolling buffer (last CONTEXT_SECONDS)."""
     p = pyaudio.PyAudio()
+    frames_per_chunk = int(CONFIG['SAMPLE_RATE'] * CONFIG['CAPTURE_CHUNK_DURATION'])
     stream = p.open(
         format=pyaudio.paInt16,
         channels=1,
         rate=CONFIG['SAMPLE_RATE'],
         input=True,
-        frames_per_buffer=int(CONFIG['SAMPLE_RATE'] * CONFIG['CHUNK_DURATION'])
+        frames_per_buffer=frames_per_chunk,
     )
-    
-    print("🎤 Audio capture started")
-    
-    frames_per_chunk = int(CONFIG['SAMPLE_RATE'] * CONFIG['CHUNK_DURATION'])
+    print("🎤 Audio capture started (1s chunks → last %ds buffer)" % CONFIG['CONTEXT_SECONDS'])
     try:
         while True:
             try:
-                # exception_on_overflow=False avoids crash; we may get partial chunk on overflow
-                audio_chunk = stream.read(
-                    frames_per_chunk,
-                    exception_on_overflow=False,
-                )
+                audio_chunk = stream.read(frames_per_chunk, exception_on_overflow=False)
             except OSError as e:
-                if e.errno == -9981:  # PA_INPUT_OVERFLOWED
-                    continue  # skip this chunk, avoid crash
+                if e.errno == -9981:
+                    continue
                 raise
-            if len(audio_chunk) < frames_per_chunk * 2:  # int16 = 2 bytes per sample
-                continue  # partial chunk after overflow, skip
+            if len(audio_chunk) < frames_per_chunk * 2:
+                continue
             waveform = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
-            audio_queue.put((time.time(), waveform))
+            with state.lock:
+                state.raw_audio_buffer.append((time.time(), waveform))
     except KeyboardInterrupt:
         stream.stop_stream()
         stream.close()
         p.terminate()
 
 def speaker_identification_thread():
-    """Process audio chunks for speaker ID and transcription"""
+    """Every CHECK_INTERVAL s, process last CONTEXT_SECONDS of audio for speaker ID and transcription."""
     global state
     current_speaker = None
-    
+
     while True:
-        timestamp, waveform = audio_queue.get()
-        
-        # Check for voice activity
+        time.sleep(CONFIG['CHECK_INTERVAL'])
+
+        with state.lock:
+            if len(state.raw_audio_buffer) == 0:
+                continue
+            chunks = list(state.raw_audio_buffer)
+        # Concatenate last CONTEXT_SECONDS (e.g. 5s) into one waveform
+        timestamps = [c[0] for c in chunks]
+        waveform = np.concatenate([c[1] for c in chunks])
+        timestamp = timestamps[-1]  # use end of window
+
+        if len(waveform) < CONFIG['SAMPLE_RATE']:  # need at least 1s
+            continue
+
         if not has_voice_activity(waveform):
             if current_speaker is not None:
                 print(f"\n🔇 Silence...")
                 current_speaker = None
-            
             with state.lock:
                 if state.active and (time.time() - state.last_activity) > CONFIG['SILENCE_TIMEOUT']:
-                    # End conversation
                     print("\n🔴 Conversation ended - processing...")
                     end_conversation()
                     state.active = False
                     state.speakers.clear()
                     current_speaker = None
             continue
-        
-        # Voice detected - identify speaker
+
+        # Voice detected - identify speaker (on full context window)
         waveform_torch = torch.tensor(waveform).unsqueeze(0)
         embedding = embedding_model({"waveform": waveform_torch, "sample_rate": CONFIG['SAMPLE_RATE']})
         speaker = identify_speaker(embedding)
-        
-        # Transcribe
+
         text = transcribe_audio(waveform)
-        
-        # Skip if no text (noise, cough, etc)
         if not text:
             continue
-        
-        # LIVE DISPLAY
+
+        # Dedupe: skip if same as last transcript entry (overlapping windows)
+        with state.lock:
+            if state.transcript and state.transcript[-1][1] == speaker and state.transcript[-1][2] == text:
+                continue
+
         if speaker != current_speaker:
             print(f"\n💬 {speaker}:")
             current_speaker = speaker
         print(f"   {text}")
-        
-        # Check for manual screenshot command
+
         if "gemini" in text.lower() and "screenshot" in text.lower():
             ts, path = take_screenshot("manual")
             with state.lock:
                 state.screenshots.append((datetime.fromtimestamp(timestamp), path))
             ui_notification_queue.put(("screenshot", f"Screenshot saved: {path}"))
-        
+
         with state.lock:
             state.last_activity = time.time()
             state.audio_buffer.append((timestamp, speaker, text))
-            
-            # Start conversation if not active
             if not state.active:
                 state.active = True
                 state.transcript = []
@@ -302,13 +311,9 @@ def speaker_identification_thread():
                 print(f"\n🟢 Conversation started")
                 print(f"💬 {speaker}:")
                 print(f"   {text}")
-            
-            # Add/update speaker
             if speaker not in state.speakers:
                 state.speakers.add(speaker)
                 print(f"👤 {speaker} joined the conversation")
-            
-            # Add to transcript
             state.transcript.append((datetime.fromtimestamp(timestamp), speaker, text))
 def todo_monitor_thread():
     """Periodically check for todos"""
