@@ -90,6 +90,16 @@ state = ConversationState()
 # Queues for inter-thread communication
 ui_notification_queue = queue.Queue()
 
+# Latency metrics (append from threads, read after shutdown)
+_metrics_lock = threading.Lock()
+_latency_metrics = {
+    "vad": [],
+    "speaker_diarization": [],
+    "todo_check": [],
+    "visual_cue_check": [],
+    "screenshot_keyword_check": [],
+}
+
 def _embedding_vector(arr):
     """Normalize to (512,) for cosine: handle both whole-window (512,) and sliding (T, 512)."""
     x = np.asarray(arr).flatten()
@@ -262,7 +272,11 @@ def speaker_identification_thread():
         if len(waveform) < CONFIG['SAMPLE_RATE']:  # need at least 1s
             continue
 
-        if not has_voice_activity(waveform):
+        t0 = time.perf_counter()
+        vad_result = has_voice_activity(waveform)
+        with _metrics_lock:
+            _latency_metrics["vad"].append(time.perf_counter() - t0)
+        if not vad_result:
             if current_speaker is not None:
                 print(f"\n🔇 Silence...")
                 current_speaker = None
@@ -277,8 +291,11 @@ def speaker_identification_thread():
 
         # Voice detected - identify speaker (on full context window)
         waveform_torch = torch.tensor(waveform).unsqueeze(0)
+        t0 = time.perf_counter()
         embedding = embedding_model({"waveform": waveform_torch, "sample_rate": CONFIG['SAMPLE_RATE']})
         speaker = identify_speaker(embedding)
+        with _metrics_lock:
+            _latency_metrics["speaker_diarization"].append(time.perf_counter() - t0)
 
         text = transcribe_audio(waveform)
         if not text:
@@ -294,7 +311,11 @@ def speaker_identification_thread():
             current_speaker = speaker
         print(f"   {text}")
 
-        if "gemini" in text.lower() and "screenshot" in text.lower():
+        t0 = time.perf_counter()
+        screenshot_triggered = "gemini" in text.lower() and "screenshot" in text.lower()
+        with _metrics_lock:
+            _latency_metrics["screenshot_keyword_check"].append(time.perf_counter() - t0)
+        if screenshot_triggered:
             ts, path = take_screenshot("manual")
             with state.lock:
                 state.screenshots.append((datetime.fromtimestamp(timestamp), path))
@@ -335,7 +356,10 @@ def todo_monitor_thread():
             text_window = "\n".join([f"{s}: {t}" for _, s, t in recent[-10:]])
             last_check_idx = len(state.transcript)
         
+        t0 = time.perf_counter()
         todos = check_for_todos(text_window)
+        with _metrics_lock:
+            _latency_metrics["todo_check"].append(time.perf_counter() - t0)
         for todo in todos:
             ui_notification_queue.put(("todo", todo))
             print(f"✓ TODO detected: {todo}")
@@ -359,7 +383,11 @@ def visual_cue_monitor_thread():
             text_window = "\n".join([f"{s}: {t}" for _, s, t in recent[-5:]])
             last_check_idx = len(state.transcript)
         
-        if check_for_visual_cues(text_window):
+        t0 = time.perf_counter()
+        visual_cue = check_for_visual_cues(text_window)
+        with _metrics_lock:
+            _latency_metrics["visual_cue_check"].append(time.perf_counter() - t0)
+        if visual_cue:
             ts, path = take_screenshot("auto")
             with state.lock:
                 state.screenshots.append((ts, path))
@@ -414,6 +442,31 @@ def end_conversation():
     print(f"\n📝 Summary saved: {output_file}")
     print(f"📋 {len(all_todos)} todos identified")
 
+def _print_latency_metrics():
+    """Print latency stats for VAD, speaker diarization, and the 3 keyword checks."""
+    with _metrics_lock:
+        data = {k: list(v) for k, v in _latency_metrics.items()}
+    if not any(data.values()):
+        print("No latency metrics collected.")
+        return
+    print("\n" + "=" * 60)
+    print("LATENCY METRICS")
+    print("=" * 60)
+    for name, times in data.items():
+        if not times:
+            print(f"  {name}: (no samples)")
+            continue
+        arr = np.array(times) * 1000  # ms
+        n = len(arr)
+        print(f"  {name}:")
+        print(f"    count={n}, mean={arr.mean():.2f} ms, min={arr.min():.2f} ms, max={arr.max():.2f} ms")
+        if n >= 2:
+            p50 = np.percentile(arr, 50)
+            p95 = np.percentile(arr, 95)
+            print(f"    p50={p50:.2f} ms, p95={p95:.2f} ms")
+    print("=" * 60)
+
+
 def main():
     """Start all threads"""
     threads = [
@@ -434,6 +487,7 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
+        _print_latency_metrics()
 
 if __name__ == "__main__":
     main()
