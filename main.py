@@ -19,6 +19,7 @@ from collections import deque
 import google.generativeai as genai
 import cv2
 import os
+from flask import Flask, jsonify, request, send_from_directory
 from dotenv import load_dotenv
 from huggingface_hub import login
 import whisper
@@ -98,6 +99,50 @@ state = ConversationState()
 
 # Queues for inter-thread communication
 ui_notification_queue = queue.Queue()
+
+# Keyword trigger data exposed for UI (main thread / frontend polls this)
+_keyword_trigger_lock = threading.Lock()
+keyword_trigger_events = deque(maxlen=200)  # recent events: {"type", "data", "timestamp"}
+
+# Conversation status for UI: "idle" | "active" | "ended"
+_conversation_status_lock = threading.Lock()
+conversation_status = "idle"
+
+
+def get_conversation_status():
+    """Return current conversation status for the frontend."""
+    with _conversation_status_lock:
+        return conversation_status
+
+
+def get_keyword_triggers():
+    """Return a snapshot of recent keyword trigger events for the frontend to poll."""
+    with _keyword_trigger_lock:
+        return [{"type": e["type"], "data": e["data"], "timestamp": e["timestamp"]} for e in keyword_trigger_events]
+
+
+def get_keyword_triggers_since(since_timestamp):
+    """Return keyword trigger events after the given timestamp (for polling 'only new')."""
+    with _keyword_trigger_lock:
+        return [
+            {"type": e["type"], "data": e["data"], "timestamp": e["timestamp"]}
+            for e in keyword_trigger_events
+            if e["timestamp"] > since_timestamp
+        ]
+
+
+def get_transcript():
+    """Return current transcript for the UI: list of {timestamp, speaker, text}."""
+    with state.lock:
+        return [
+            {
+                "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else ts,
+                "speaker": speaker,
+                "text": text,
+            }
+            for ts, speaker, text in state.transcript
+        ]
+
 
 # Latency metrics (append from threads, read after shutdown)
 _metrics_lock = threading.Lock()
@@ -289,7 +334,7 @@ def audio_capture_thread():
 
 def speaker_identification_thread():
     """Every CHECK_INTERVAL s, process last CONTEXT_SECONDS of audio for speaker ID and transcription."""
-    global state
+    global state, conversation_status
     current_speaker = None
 
     while True:
@@ -321,6 +366,8 @@ def speaker_identification_thread():
                     end_conversation()
                     state.active = False
                     state.speakers.clear()
+                    with _conversation_status_lock:
+                        conversation_status = "ended"
                     current_speaker = None
             continue
 
@@ -363,12 +410,20 @@ def speaker_identification_thread():
                     with state.lock:
                         state.photos.append((datetime.fromtimestamp(timestamp), path))
                     ui_notification_queue.put(("photo", f"Camera photo saved: {path}"))
+                    with _keyword_trigger_lock:
+                        keyword_trigger_events.append({
+                            "type": "photo",
+                            "data": f"Camera photo saved: {path}",
+                            "timestamp": time.time(),
+                        })
 
         with state.lock:
             state.last_activity = time.time()
             state.audio_buffer.append((timestamp, speaker, text))
             if not state.active:
                 state.active = True
+                with _conversation_status_lock:
+                    conversation_status = "active"
                 state.transcript = []
                 state.photos = []
                 state.emitted_todos = set()
@@ -411,6 +466,12 @@ def todo_monitor_thread():
                 seen.add(t)
         for todo in new_todos:
             ui_notification_queue.put(("todo", todo))
+            with _keyword_trigger_lock:
+                keyword_trigger_events.append({
+                    "type": "todo",
+                    "data": todo,
+                    "timestamp": time.time(),
+                })
 
 def visual_cue_monitor_thread():
     """Periodically check for visual references"""
@@ -447,6 +508,12 @@ def visual_cue_monitor_thread():
                     with state.lock:
                         state.photos.append((ts, path))
                     ui_notification_queue.put(("photo", "Auto camera photo taken"))
+                    with _keyword_trigger_lock:
+                        keyword_trigger_events.append({
+                            "type": "photo",
+                            "data": "Auto camera photo taken",
+                            "timestamp": time.time(),
+                        })
 
 def ui_notification_thread():
     """Display UI notifications (placeholder - implement actual UI)"""
@@ -496,6 +563,48 @@ def end_conversation():
     print(f"\n📝 Summary saved: {output_file}")
     print(f"📋 {len(all_todos)} todos identified")
 
+# --- Web UI (Flask in a thread; frontend polls keyword_trigger_events)
+UI_PORT = 5050
+app = Flask(__name__, static_folder="ui_static", static_url_path="")
+
+
+@app.route("/api/keyword_triggers")
+def api_keyword_triggers():
+    """Return all recent keyword trigger events (frontend polls this)."""
+    return jsonify(get_keyword_triggers())
+
+
+@app.route("/api/state")
+def api_state():
+    """Return conversation status for the UI (started / idle / ended)."""
+    return jsonify({"conversation_status": get_conversation_status()})
+
+
+@app.route("/api/transcript")
+def api_transcript():
+    """Return current transcript (speaker + text chunks) for speech bubbles."""
+    return jsonify(get_transcript())
+
+
+@app.route("/api/keyword_triggers/since")
+def api_keyword_triggers_since():
+    """Return keyword triggers after timestamp (query param: ts=float)."""
+    try:
+        since = float(request.args.get("ts", 0))
+    except (TypeError, ValueError):
+        since = 0.0
+    return jsonify(get_keyword_triggers_since(since))
+
+
+@app.route("/")
+def ui_index():
+    return send_from_directory(app.static_folder, "index.html")
+
+
+def run_ui_server():
+    app.run(host="0.0.0.0", port=UI_PORT, use_reloader=False, threaded=True)
+
+
 def _print_latency_metrics():
     """Print latency stats for VAD, speaker diarization, and the 3 keyword checks."""
     with _metrics_lock:
@@ -530,12 +639,14 @@ def main():
         threading.Thread(target=todo_monitor_thread, daemon=True),
         threading.Thread(target=visual_cue_monitor_thread, daemon=True),
         threading.Thread(target=ui_notification_thread, daemon=True),
+        threading.Thread(target=run_ui_server, daemon=True),
     ]
     
     for t in threads:
         t.start()
     
     print("🚀 AI Notetaker started. Press Ctrl+C to stop.")
+    print(f"📺 UI: http://localhost:{UI_PORT}/")
     
     try:
         while True:

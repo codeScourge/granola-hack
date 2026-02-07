@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Keyword Triggers — AI Notetaker</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 560px;
+      margin: 0 auto;
+      padding: 1.5rem;
+      background: #0f0f12;
+      color: #e4e4e7;
+      min-height: 100vh;
+    }
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+      color: #fafafa;
+    }
+    .status {
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: #a1a1aa;
+      margin: 0 0 1rem 0;
+      padding: 0.5rem 0.75rem;
+      background: #18181b;
+      border-radius: 6px;
+      display: inline-block;
+    }
+    .status.active { color: #22c55e; }
+    .status.ended { color: #f59e0b; }
+    .sub {
+      font-size: 0.875rem;
+      color: #71717a;
+      margin-bottom: 1.5rem;
+    }
+    #events {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    #events li {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+      padding: 0.75rem 1rem;
+      margin-bottom: 0.5rem;
+      background: #18181b;
+      border-radius: 8px;
+      border-left: 3px solid #3b82f6;
+    }
+    #events li.photo { border-left-color: #22c55e; }
+    #events li.todo { border-left-color: #eab308; }
+    .icon { font-size: 1.25rem; flex-shrink: 0; }
+    .content { flex: 1; word-break: break-word; }
+    .time {
+      font-size: 0.75rem;
+      color: #71717a;
+      margin-top: 0.25rem;
+    }
+    .empty {
+      color: #71717a;
+      font-size: 0.9375rem;
+      padding: 1rem 0;
+    }
+    .transcript-section {
+      margin-top: 2.5rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid #27272a;
+    }
+    .transcript-section h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      color: #a1a1aa;
+      margin-bottom: 1rem;
+    }
+    #transcript {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+    #transcript .bubble {
+      max-width: 85%;
+      padding: 0.6rem 0.9rem;
+      border-radius: 14px;
+      position: relative;
+      word-break: break-word;
+    }
+    #transcript .bubble.left {
+      align-self: flex-start;
+      background: #27272a;
+      border-bottom-left-radius: 4px;
+    }
+    #transcript .bubble.right {
+      align-self: flex-end;
+      background: #3b82f6;
+      color: #fafafa;
+      border-bottom-right-radius: 4px;
+    }
+    #transcript .bubble .speaker {
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      margin-bottom: 0.2rem;
+      opacity: 0.9;
+    }
+    #transcript .bubble.right .speaker { color: #bfdbfe; }
+    #transcript .bubble .time {
+      font-size: 0.65rem;
+      opacity: 0.7;
+      margin-top: 0.25rem;
+    }
+    .transcript-empty {
+      color: #71717a;
+      font-size: 0.875rem;
+      padding: 0.5rem 0;
+    }
+  </style>
+</head>
+<body>
+  <p class="status" id="status">—</p>
+  <h1>Keyword Triggers</h1>
+  <p class="sub">Updates when a keyword (photo, todo) is detected.</p>
+  <ul id="events"></ul>
+  <p class="empty" id="empty">No triggers yet. Polling…</p>
+
+  <section class="transcript-section">
+    <h2>Transcript</h2>
+    <ul id="transcript"></ul>
+    <p class="transcript-empty" id="transcript-empty">No transcript yet.</p>
+  </section>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const eventsEl = document.getElementById('events');
+    const emptyEl = document.getElementById('empty');
+    const transcriptEl = document.getElementById('transcript');
+    const transcriptEmptyEl = document.getElementById('transcript-empty');
+    const POLL_MS = 2000;
+    let lastTimestamp = 0;
+    const speakerSide = {}; // speaker -> 'left' | 'right'
+
+    const STATUS_TEXT = {
+      idle: 'Not started',
+      active: 'Conversation started',
+      ended: 'Conversation ended'
+    };
+
+    function formatTime(ts) {
+      const d = new Date(ts * 1000);
+      return d.toLocaleTimeString();
+    }
+
+    function render(events) {
+      emptyEl.style.display = events.length ? 'none' : 'block';
+      if (!events.length) return;
+      const newOnes = events.filter(e => e.timestamp > lastTimestamp);
+      if (newOnes.length) lastTimestamp = Math.max(...newOnes.map(e => e.timestamp));
+      const sorted = [...events].sort((a, b) => b.timestamp - a.timestamp);
+      eventsEl.innerHTML = sorted.map(e => `
+        <li class="${e.type}">
+          <span class="icon">${e.type === 'photo' ? '📷' : '✓'}</span>
+          <div class="content">
+            <div>${escapeHtml(e.data)}</div>
+            <div class="time">${formatTime(e.timestamp)}</div>
+          </div>
+        </li>
+      `).join('');
+    }
+
+    function escapeHtml(s) {
+      const div = document.createElement('div');
+      div.textContent = s;
+      return div.innerHTML;
+    }
+
+    function sideForSpeaker(speaker) {
+      if (speakerSide[speaker] === undefined) {
+        speakerSide[speaker] = Object.keys(speakerSide).length % 2 === 0 ? 'left' : 'right';
+      }
+      return speakerSide[speaker];
+    }
+
+    function formatTranscriptTime(ts) {
+      if (!ts) return '';
+      try {
+        const d = typeof ts === 'string' ? new Date(ts) : new Date(ts * 1000);
+        return d.toLocaleTimeString();
+      } catch (_) { return ts; }
+    }
+
+    function renderTranscript(entries) {
+      transcriptEmptyEl.style.display = entries.length ? 'none' : 'block';
+      if (!entries.length) return;
+      transcriptEl.innerHTML = entries.map(e => {
+        const side = sideForSpeaker(e.speaker);
+        return `<li class="bubble ${side}">
+          <div class="speaker">${escapeHtml(e.speaker)}</div>
+          <div>${escapeHtml(e.text)}</div>
+          <div class="time">${formatTranscriptTime(e.timestamp)}</div>
+        </li>`;
+      }).join('');
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    function pollState() {
+      fetch('/api/state')
+        .then(r => r.json())
+        .then(d => {
+          const s = d.conversation_status || 'idle';
+          statusEl.textContent = STATUS_TEXT[s] || s;
+          statusEl.className = 'status ' + s;
+        })
+        .catch(() => { statusEl.textContent = '—'; });
+    }
+
+    function poll() {
+      pollState();
+      fetch('/api/keyword_triggers')
+        .then(r => r.json())
+        .then(render)
+        .catch(() => { emptyEl.textContent = 'Could not load triggers.'; });
+      fetch('/api/transcript')
+        .then(r => r.json())
+        .then(renderTranscript)
+        .catch(() => { transcriptEmptyEl.textContent = 'Could not load transcript.'; });
+    }
+
+    poll();
+    setInterval(poll, POLL_MS);
+  </script>
+</body>
+</html>
