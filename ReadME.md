@@ -84,6 +84,58 @@ I'm so excited about this opportunity!
 Unfortunately, we'll need to postpone the event.
 That's really frustrating, but I understand.
 Wow, congratulations on the achievement!
+
+
+
+
+
+=== SECTION 7: Fricatives and Sibilants (25 seconds) ===
+The thief seized the fleece from the freezing breeze.
+Sushi chefs choose fresh fish seasonally.
+Vicious wolves ventured through the valley very cautiously.
+Measure the treasure with pleasure, not pressure.
+
+=== SECTION 8: Plosives and Stops (25 seconds) ===
+Pack the black backpack with snacks for the track.
+Did David deliver the dividend to theividual?
+Take the ticket to the cricket wicket at the thicket.
+The big dog dug deep ditches behind the bridge.
+
+=== SECTION 9: Nasal Sounds (25 seconds) ===
+Many men manage money in Manhattan minimally.
+Nine nimble numbats gnaw on noodles near noon.
+Morning meetings meandering through mundane minutes.
+Running along the long winding canyon in spring.
+
+=== SECTION 10: Vowel Diversity (30 seconds) ===
+Beat, bit, bet, bat, boot, but, bought, boat.
+The heat made Pete seek the creek to cool his feet.
+Oil the coil before joining the royal convoy.
+How now brown cow, allow me to avow my vow.
+
+=== SECTION 11: Connected Speech / Reductions (30 seconds) ===
+I'm gonna grab something to eat, wanna come?
+Shoulda, woulda, coulda - but we didn't, did we?
+Whatcha doing later? D'you wanna meet up?
+I'll probably hafta check with 'em before I can say for sure.
+
+=== SECTION 12: Workplace Scenarios (30 seconds) ===
+Could you send me that spreadsheet by end of day?
+I'll be out of office next Monday through Wednesday.
+Let's circle back on this after we sync with the team.
+Can you hop on a quick call to discuss the deliverables?
+
+=== SECTION 13: Casual Conversation (30 seconds) ===
+Yeah, I totally get what you're saying, but like, honestly?
+I mean, it's not that big of a deal, you know?
+Oh my god, did you see what happened yesterday?
+No way! Are you serious? That's crazy!
+
+=== SECTION 14: Longer Sentences (30 seconds) ===
+After considering all the available options and weighing the potential consequences, 
+I've decided to proceed with the original plan despite the challenges.
+The reality is that we need to fundamentally rethink our approach 
+if we want to achieve meaningful results within the timeframe
 ```
 
 

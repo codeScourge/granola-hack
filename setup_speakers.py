@@ -42,6 +42,10 @@ def enroll_speaker_multi_condition(name, samples):
             emb = inference.crop(audio_file, segment)
         else:
             emb = inference(audio_file)
+        emb = np.array(emb)
+        # Normalize to 1D: crop returns (1, D), inference(file) can return (N, D)
+        if emb.ndim > 1:
+            emb = np.mean(emb, axis=0)
         embeddings.append(emb)
     
     if not embeddings:

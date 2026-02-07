@@ -60,6 +60,9 @@ def test_conversation_visual(audio_file):
     # Save clips for manual review (clamp segment to file duration to avoid crop errors)
     output_dir = Path("review_segments")
     output_dir.mkdir(exist_ok=True)
+    for old in output_dir.iterdir():
+        if old.is_file():
+            old.unlink()
     file_duration = audio.get_duration(audio_file)
 
     for i, r in enumerate(results):

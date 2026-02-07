@@ -45,7 +45,7 @@ CONFIG = {
     'SCREENSHOT_CHECK_WINDOW': 15,
     'VAD_THRESHOLD': 0.02,  # voice activity detection threshold
     'HF_TOKEN': os.environ.get('HF_KEY', ''),
-    'GEMINI_API_KEY': os.environ.get('GEMINI_KEY', ''),
+    'GEMINI_API_KEY': os.environ.get('GEMINI_KEY'),
     'SAMPLE_RATE': 16000
 }
 
@@ -55,7 +55,7 @@ whisper_model = whisper.load_model("base")  # or "small", "medium", "large"
 print("✓ Whisper loaded")
 
 genai.configure(api_key=CONFIG['GEMINI_API_KEY'])
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 
 # --- getting annote 
@@ -218,9 +218,21 @@ def audio_capture_thread():
     
     print("🎤 Audio capture started")
     
+    frames_per_chunk = int(CONFIG['SAMPLE_RATE'] * CONFIG['CHUNK_DURATION'])
     try:
         while True:
-            audio_chunk = stream.read(int(CONFIG['SAMPLE_RATE'] * CONFIG['CHUNK_DURATION']))
+            try:
+                # exception_on_overflow=False avoids crash; we may get partial chunk on overflow
+                audio_chunk = stream.read(
+                    frames_per_chunk,
+                    exception_on_overflow=False,
+                )
+            except OSError as e:
+                if e.errno == -9981:  # PA_INPUT_OVERFLOWED
+                    continue  # skip this chunk, avoid crash
+                raise
+            if len(audio_chunk) < frames_per_chunk * 2:  # int16 = 2 bytes per sample
+                continue  # partial chunk after overflow, skip
             waveform = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
             audio_queue.put((time.time(), waveform))
     except KeyboardInterrupt:
