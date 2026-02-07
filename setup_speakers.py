@@ -1,41 +1,78 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 import pickle
 import numpy as np
-from pathlib import Path
-from pyannote.audio import Inference
-from pyannote.audio import Audio
 
-SPEAKERS_SAMPLES_DIR = Path("speakers_samples")
+# PyTorch 2.6+ defaults to weights_only=True; pyannote checkpoints contain
+# PyTorch Lightning classes (e.g. EarlyStopping). Allow loading (trusted HF source).
+import torch
+_torch_load = torch.load
+def _load_trusted(*args, **kwargs):
+    kwargs["weights_only"] = False  # override Lightning's explicit weights_only=True
+    return _torch_load(*args, **kwargs)
+torch.load = _load_trusted
 
-# Load embedding model
-model = Inference("pyannote/embedding", window="whole")
+from pyannote.audio import Model, Inference, Audio
+from pyannote.core import Segment
+
+load_dotenv()
+
+hf_token = os.environ.get("HF_KEY")
+if not hf_token:
+    raise SystemExit(
+        "HF_KEY must be set. "
+        "Accept conditions at https://hf.co/pyannote/embedding"
+    )
+
+# Login BEFORE importing pyannote
+from huggingface_hub import login
+login(token=hf_token)
+
+SPEAKER_SAMPLES_DIR = Path("speakers_samples")
+ACCEPTABLE_EXTENSIONS = {".mp3"}
+
+# Model should load without needing token parameter after login
+model = Model.from_pretrained("pyannote/embedding")
+inference = Inference(model)
 audio = Audio(sample_rate=16000, mono="downmix")
 
-# Store speaker embeddings
 speaker_db = {}
 
-def enroll_speaker(name, audio_file):
-    """Extract and store speaker embedding from whole file"""
-    waveform, sr = audio(audio_file)
-    embedding = model({"waveform": waveform, "sample_rate": sr})
-    if name not in speaker_db:
-        speaker_db[name] = []
-    speaker_db[name].append(embedding)
+def enroll_speaker_multi_condition(name, samples):
+    embeddings = []
+    for audio_file, start, end, condition in samples:
+        if start is not None and end is not None:
+            segment = Segment(start, end)
+            emb = inference.crop(audio_file, segment)
+        else:
+            emb = inference(audio_file)
+        embeddings.append(emb)
+    
+    if not embeddings:
+        return
+    speaker_db[name] = np.mean(embeddings, axis=0)
 
-# Enroll all .wav files from speakers_samples; label each as its filename (stem)
-wav_files = list(SPEAKERS_SAMPLES_DIR.glob("*.wav"))
-if not wav_files:
-    raise SystemExit(f"No .wav files found in {SPEAKERS_SAMPLES_DIR}")
+if not SPEAKER_SAMPLES_DIR.exists():
+    raise SystemExit(f"Directory {SPEAKER_SAMPLES_DIR} not found")
 
-for wav_path in wav_files:
-    name = wav_path.stem  # filename without .wav
-    enroll_speaker(name, str(wav_path))
+subdirs = [d for d in SPEAKER_SAMPLES_DIR.iterdir() if d.is_dir()]
+if not subdirs:
+    raise SystemExit(f"No speaker folders found in {SPEAKER_SAMPLES_DIR}")
 
-# Average embeddings per speaker
-for name in speaker_db:
-    speaker_db[name] = np.mean(speaker_db[name], axis=0)
+for speaker_dir in sorted(subdirs):
+    name = speaker_dir.name
+    files = [p for p in speaker_dir.iterdir() 
+             if p.is_file() and p.suffix.lower() in ACCEPTABLE_EXTENSIONS]
+    if not files:
+        print(f"Warning: no audio files in {speaker_dir}")
+        continue
+    
+    samples = [(str(p), None, None, p.stem) for p in sorted(files)]
+    enroll_speaker_multi_condition(name, samples)
+    print(f"Enrolled '{name}' with {len(samples)} sample(s)")
 
-# Save
 with open("speaker_db.pkl", "wb") as f:
     pickle.dump(speaker_db, f)
 
-print(f"Enrolled {len(speaker_db)} speakers")
+print(f"Enrolled {len(speaker_db)} speakers → speaker_db.pkl")
