@@ -1,0 +1,16 @@
+Conversation Summary - 20260207_175824
+Participants: 
+
+The conversation revolves around a device being developed that records conversations, takes pictures, and generates summaries that include visual context. The device uses a camera to take photos based on keywords or phrases spoken in the conversation, such as "we should buy this." The device's ability to summarize and include images is being tested and demonstrated in real time. There is discussion about the device's capability to capture speaker duration, potential models for use in the device, and the use of Gemini for its development. The speakers also discuss neuro-tech, EEG caps, and brain activity measurement using infrared. The speakers mention a podcast and neuro-tech. They discuss featuring people in the neuro-tech space on the podcast.
+
+**Images:**
+
+*   photos/photo\_20260207\_173753\_auto.png: A screenshot from Gemini
+*   photos/photo\_20260207\_173837\_auto.png: Appears to be a screenshot of the device in action, taking a photo.
+*   photos/photo\_20260207\_173943\_auto.png: Another screenshot of the device in action.
+*   photos/photo\_20260207\_174039\_auto.png: Screenshot of some text.
+*   photos/photo\_20260207\_175259\_auto.png: Screenshot of a person wearing a device.
+*   photos/photo\_20260207\_175400\_auto.png: Appears to be a screenshot of the device in action, taking a photo.
+
+
+--- ACTION ITEMS ---

@@ -49,7 +49,7 @@ CONFIG = {
     'PHOTO_CHECK_INTERVAL': 5,
     'PHOTO_CHECK_WINDOW': 5,
     'CAMERA_INDEX': 0,
-    'CAMERA_WARMUP_FRAMES': 15,  # discard this many frames per capture so exposure adjusts
+    'CAMERA_WARMUP_FRAMES': 8,  # discard this many frames per capture so exposure adjusts
     'HF_TOKEN': os.environ.get('HF_KEY'),
     'GEMINI_API_KEY': os.environ.get('GEMINI_KEY'),
     'SAMPLE_RATE': 16000
@@ -94,7 +94,7 @@ class ConversationState:
         # Raw audio: last CONTEXT_SECONDS (e.g. 5) chunks of CAPTURE_CHUNK_DURATION each
         self.raw_audio_buffer = deque(maxlen=CONFIG['CONTEXT_SECONDS'])
         self.lock = threading.Lock()
-        
+        self.conversation_summarized = False  # avoid double summary on Ctrl+C after silence
 state = ConversationState()
 
 # Queues for inter-thread communication
@@ -108,11 +108,21 @@ keyword_trigger_events = deque(maxlen=200)  # recent events: {"type", "data", "t
 _conversation_status_lock = threading.Lock()
 conversation_status = "idle"
 
+# Last summary for UI (set when conversation ends)
+_summary_lock = threading.Lock()
+last_summary = None  # {"text": str, "output_file": str, "timestamp": str} or None
+
 
 def get_conversation_status():
     """Return current conversation status for the frontend."""
     with _conversation_status_lock:
         return conversation_status
+
+
+def get_summary():
+    """Return last summary for the frontend (None if none yet)."""
+    with _summary_lock:
+        return dict(last_summary) if last_summary else None
 
 
 def get_keyword_triggers():
@@ -276,20 +286,34 @@ Conversation:
         print(f"Visual cue check error: {e}")
         return False
 
+def _to_epoch_seconds(t):
+    """Robust conversion to epoch seconds for timestamp comparison (datetime or float)."""
+    if t is None:
+        return 0.0
+    if hasattr(t, "timestamp"):
+        return t.timestamp()
+    try:
+        return float(t)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def summarize_conversation(transcript, photos):
-    """Generate final summary"""
-    # Build context with positioned camera photos
+    """Generate final summary. Only photo paths are included in the prompt (not image pixels)."""
+    # Build context with positioned camera photos (paths only; Gemini does not receive image data)
     context = "# Conversation Transcript\n\n"
-    
+    PHOTO_WINDOW_SEC = 5
+
     for ts, speaker, text in transcript:
-        context += f"[{ts.strftime('%H:%M:%S')}] {speaker}: {text}\n"
-        # Check if a photo was taken around this time
+        ts_sec = _to_epoch_seconds(ts)
+        ts_str = ts.strftime("%H:%M:%S") if hasattr(ts, "strftime") else str(ts)
+        context += f"[{ts_str}] {speaker}: {text}\n"
         for photo_ts, photo_path in photos:
-            if abs((photo_ts - ts).total_seconds()) < 5:
+            if abs(_to_epoch_seconds(photo_ts) - ts_sec) < PHOTO_WINDOW_SEC:
                 context += f"  📷 Photo: {photo_path}\n"
     
     prompt = f"""Summarize this conversation clearly and concisely. 
-Do NOT include todos in the summary - they will be listed separately.
+Do NOT include todos in the summary - they will be listed separately. there will be images included in the context, desribe the images to enhance the summary.
 
 {context}
 
@@ -360,15 +384,18 @@ def speaker_identification_thread():
             if current_speaker is not None:
                 print(f"\n🔇 Silence...")
                 current_speaker = None
+            run_end_conversation = False
             with state.lock:
                 if state.active and (time.time() - state.last_activity) > CONFIG['SILENCE_TIMEOUT']:
                     print("\n🔴 Conversation ended - processing...")
-                    end_conversation()
-                    state.active = False
-                    state.speakers.clear()
                     with _conversation_status_lock:
                         conversation_status = "ended"
+                    state.active = False
+                    state.speakers.clear()
+                    run_end_conversation = True
                     current_speaker = None
+            if run_end_conversation:
+                end_conversation()  # call outside state.lock to avoid deadlock
             continue
 
         # Voice detected - identify speaker (on full context window)
@@ -422,6 +449,7 @@ def speaker_identification_thread():
             state.audio_buffer.append((timestamp, speaker, text))
             if not state.active:
                 state.active = True
+                state.conversation_summarized = False
                 with _conversation_status_lock:
                     conversation_status = "active"
                 state.transcript = []
@@ -533,25 +561,30 @@ def ui_notification_thread():
         time.sleep(1)
 
 def end_conversation():
-    """Process and summarize ended conversation"""
+    """Process and summarize ended conversation. Safe to call on Ctrl+C; no-op if already summarized."""
     global state
-    
+
     with state.lock:
+        if state.conversation_summarized:
+            return
         transcript = state.transcript.copy()
         photos = state.photos.copy()
-    
+        state.conversation_summarized = True
+
+    if not transcript and not photos:
+        return
 
     full_text = "\n".join([f"{s}: {t}" for _, s, t in transcript])
-    all_todos = "" # TODO: check_for_todos(full_text)
-    
+    all_todos = ""  # TODO: check_for_todos(full_text)
+
     # Generate summary
     summary = summarize_conversation(transcript, photos)
-    
+
     # Save to file
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_file = f"summaries/conversation_{timestamp}.txt"
     os.makedirs("summaries", exist_ok=True)
-    
+
     with open(output_file, 'w') as f:
         f.write(f"Conversation Summary - {timestamp}\n")
         f.write(f"Participants: {', '.join(state.speakers)}\n\n")
@@ -559,9 +592,20 @@ def end_conversation():
         f.write("\n\n--- ACTION ITEMS ---\n")
         for todo in all_todos:
             f.write(f"• {todo}\n")
-    
+
+    with _summary_lock:
+        global last_summary
+        last_summary = {
+            "text": summary,
+            "output_file": output_file,
+            "timestamp": timestamp,
+        }
+
     print(f"\n📝 Summary saved: {output_file}")
     print(f"📋 {len(all_todos)} todos identified")
+    print("\n--- SUMMARY ---")
+    print(summary)
+    print("---")
 
 # --- Web UI (Flask in a thread; frontend polls keyword_trigger_events)
 UI_PORT = 5050
@@ -578,6 +622,13 @@ def api_keyword_triggers():
 def api_state():
     """Return conversation status for the UI (started / idle / ended)."""
     return jsonify({"conversation_status": get_conversation_status()})
+
+
+@app.route("/api/summary")
+def api_summary():
+    """Return last summary for the UI (when conversation ended)."""
+    s = get_summary()
+    return jsonify(s if s is not None else {})
 
 
 @app.route("/api/transcript")
@@ -653,6 +704,7 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
+        end_conversation()  # ensure summary is created on Ctrl+C
         _print_latency_metrics()
 
 if __name__ == "__main__":
